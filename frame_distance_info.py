@@ -7,7 +7,8 @@ import math
 from geopy import distance
 import pyproj           # ungefär lika dåliga resultat med
 import pymap3d as pm    # dessa, pymap3d kanske har lite mer potential
-
+from ultralytics import YOLO
+# from PIL import Image
 
 
 
@@ -94,7 +95,8 @@ def plot_point(point, angle, length):
 #     d = R * c
 #     return d * 1000*1e6 # meters # la till 1e6 litar inte på denna 
 
-
+y_model = YOLO('yolov8n.pt')
+april_tags = False
 visualization = True
 r_earth = 6378137 # m
 
@@ -122,6 +124,7 @@ file_path_phone =      '/mnt/c/plugg/Examensarbete/Videor/Daaataflyg1/gps_mob1.t
 
 Camera_matrix = [[1.31754161e+03, 0.00000000e+00, 1.01639924e+03],[0.00000000e+00, 1.31547107e+03, 5.24436193e+02],[0.00000000e+00, 0.00000000e+00, 1.00000000e+00]]
 Camera_matrix = np.array(Camera_matrix)*2 # adjusting due to calibration being done in 1080p 1080p =*1, 4k = *2 ,720p = /1.5
+# Camera_matrix = Camera_matrix/Camera_matrix[2,2] # hmmmmmmm
 camera_params = (Camera_matrix[0,0], Camera_matrix[1,1], Camera_matrix[0,2], Camera_matrix[1,2])
 
 
@@ -160,7 +163,7 @@ boat_times = np.array(boat_times)[bools]
 # we will assume constand speed between the data points
 b_interpolated_lat = []
 b_interpolated_long = []
-b_alt_interpolated =[]
+b_alt_interpolated = []
 b_bearing_interpolated = []
 # boat_times_interpolated =[]
 num_interpolations = 25
@@ -225,7 +228,43 @@ def boat_cam_angle(boat_bearing, tag, camera_matrix):
     tag_deg_offset = np.rad2deg(angle_radians)
     # approx_drone_bearing = boat_bearing + tag_deg_offset
     return tag_deg_offset # rad2deg korrekt här?
+
+def bbox_centerangle(bbox_center, camera_matrix):
+    x0, y0 = [camera_matrix[0,2],camera_matrix[1,2]]
+    invcam = np.linalg.inv(camera_matrix)
+    l_center = invcam.dot([x0, y0, 1.0])
+    xb, yb = bbox_center
+    # print([yb, xb, 1])
+    l_bbox = invcam.dot([yb, xb, 1])
+    cos_angle = l_center.dot(l_bbox) / (np.linalg.norm(l_center) * np.linalg.norm(l_bbox))
+    angle_radians = np.arccos(cos_angle)
+    bbox_deg_offset = np.rad2deg(angle_radians)
+    return bbox_deg_offset
+
+
+def boat_angledim_compensator(boat_dimensions, boat_bearing, drone_bearing): #, boat_distance, bbox_centerangle):
+    # TODO compensate for when the boat is turned in different ways towards the camera for example if its 90degrees bounding box should be length meters instead of width meters.
+    drone_bearingdeg = np.rad2deg(drone_bearing)
+    v = drone_bearingdeg%360 - boat_bearing # mod 360 fixes - negative degrees to postiive as we want ti
+    print(v)
+    b_length, b_width = boat_dimensions
+    side_length = abs(b_width*math.sin(np.deg2rad(v)))+abs(b_length*math.cos(np.deg2rad(v)))# this length is not taking the perspective distorsions into account
+    print(side_length)
+    return side_length
+
+def boat_distance(boat_dimensions, boat_bearing, drone_bearing, camera_matrix, bbox):
+    # boat dimensions in [length,width]
+    # boat bearing in degrees
+
+    # compen_len = boat_angledim_compensator(boat_dimensions, boat_bearing, drone_bearing)  # this function is not working right now 
+    compen_len = 4
     
+    focal_l = camera_matrix[0][0] # behöver antagligen fixa så att kamera matrisen får formen: [f 0 0; 0 f 0; x x 1 ] tror inte det då pajjar man uplösnings kompensatinone bara
+    dist = focal_l*compen_len/(bbox.xyxy[0][2]-bbox.xyxy[0][0])  # blir en tensor här pga bbox maybe bad?
+    return dist
+
+
+
 def tag_center_angle(tag):
     x, y, z = tag.pose_t
     return np.rad2deg(math.acos(z/np.linalg.norm([y,z])))
@@ -250,7 +289,7 @@ at_detector = Detector(families='tag36h11',
 # exit()
 
 
-start_frame_number = 1700 # 1700 är bra för 0082
+start_frame_number = 1700 # 2000 är bra för 0085 # 1700 är bra för 0082
 frame_number = start_frame_number
 bearing_window = 25
 drone_bearing = 0 # initial bearing before getting any values
@@ -274,12 +313,13 @@ while capture.isOpened():
         print(drone_times[frame_number], boat_times[int(frame_number/25)]) # printar ut för att se att tiderna är hyffsat synkade
 
 
-    if frame_number > bearing_window:
+    # if frame_number > bearing_window:
+    if frame_number % bearing_window == 0:
         drone_bearing = math.atan2(d_long[frame_number]-d_long[frame_number-bearing_window], d_lat[frame_number]-d_lat[frame_number-bearing_window])
+
         # drone_bearing = math.atan2(math.sin(d_long[frame_number]-d_long[frame_number-bearing_window])*math.cos(d_lat[frame_number]),
-                                #    math.cos(d_lat[frame_number-bearing_window])*math.sin(d_lat[frame_number]) - math.sin(frame_number-bearing_window)*math.cos(frame_number)*math.cos(d_long[frame_number]-d_long[frame_number- bearing_window]))
+        #                            math.cos(d_lat[frame_number-bearing_window])*math.sin(d_lat[frame_number]) - math.sin(frame_number-bearing_window)*math.cos(frame_number)*math.cos(d_long[frame_number]-d_long[frame_number- bearing_window]))
         plot_point((d_long[frame_number],d_lat[frame_number]),drone_bearing,0.0001)
-        print(drone_bearing)
 
 
     # new_latitude  = d_lat[frame_number]  + (dy / r_earth) * (180 / math.pi)
@@ -288,72 +328,67 @@ while capture.isOpened():
     
     # drone_bearing = math.atan2(math.sin(d_long[frame_number]-d_long[frame_number-1])*math.cos(d_lat[frame_number]),math.cos(d_lat[frame_number-1])*math.sin(d_lat[frame_number]) - math.sin(frame_number-1)*math.cos(frame_number)*math.cos(d_long[frame_number]-d_long[frame_number-1]))
     
+    # using machine learning yolov8n model
     ret, frame = capture.read()
     if ret == True:
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) 
-        tags = at_detector.detect(frame, True, camera_params, 0.1735) #  130 mm är våran man mäter insidan och den anges i meter https://github.com/AprilRobotics/apriltag?tab=readme-ov-file#pose-estimation (blir 3 pixlar man mäter)
-        # print(tags) # https://github.com/duckietown/lib-dt-apriltags/tree/daffy
-                    # pose_t är på formen X,Y,Z och med högerhandkoordinatsystem blir det: [högerled_från kameran, höjdled, avstånd pekar ut ur kameran]
-        for tag in tags:
-            # print(tag.pose_t) # prints the pose_t probably on the form X,Y,Z which translates to [right, down, distance(depth)]
-            # print(tag)
-            dx = tag.pose_t[0] # X coordinate 
-            dy = tag.pose_t[2] # Z coordinate boats relative position to the camera (no altitude yet)
-            bca = boat_cam_angle(drone_bearing, tag, Camera_matrix)
-            approx_drone_bearing = np.rad2deg(drone_bearing) + bca#tag_center_angle(tags[0])
-            print(tag.pose_t)
-            m = (1 / ((2 * math.pi / 360) * r_earth/1000)) / 1000
-            newlatlong = distance.distance(meters=tags[0].pose_t[2][0]).destination((d_lat[frame_number],d_long[frame_number]),approx_drone_bearing)
-            new_latitude, new_longitude = newlatlong.latitude, newlatlong.longitude
-
-            for idx in range(len(tag.corners)):
-                cv2.line(frame, tuple(tag.corners[idx-1, :].astype(int)), tuple(tag.corners[idx, :].astype(int)), (0, 255, 0))
-
-            cv2.putText(frame, str(tag.tag_id),
-                org=(tag.corners[0, 0].astype(int)+10,tag.corners[0, 1].astype(int)+10),
-                fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                fontScale=0.8,
-                color=(0, 0, 255))
-
-        # if tags:
-            # dx = tags[0].pose_t[0] # X coordinate 
-            # dy = tags[0].pose_t[2] # Z coordinate boats relative position to the camera (no altitude yet)
-            # bca = boat_cam_angle(drone_bearing, tags[0], Camera_matrix)
-            # approx_drone_bearing = np.rad2deg(drone_bearing) + bca#tag_center_angle(tags[0])
-            # print(tags[0].pose_t)
-
-
-
-            # print(b_bearing_interpolated[frame_number], appqrox_drone_bearing)
-
-        # else: 
-            # dx,dy = x[frame_number],y[frame_number]
-            # dx,dy,dz = gpspos
+        results = y_model(frame)
+        # plot(conf=True, line_width=None, font_size=None, font='Arial.ttf', pil=False, img=None, im_gpu=None, kpt_radius=5, kpt_line=True, labels=True, boxes=True, masks=True, probs=True, show=False, save=False, filename=None)
+        for result in results:
+            # print(result.boxes.xyxy[0][0])
+            im_array = result.plot()
+            # print(bool(result.boxes))
+        if result.boxes:
+            frame = im_array
             
-            # new_latitude = d_lat[frame_number] + dy*m
-            # new_longitude = d_long[frame_number] + (dx*m) / math.cos(d_lat[frame_number] * (math.pi / 180))
-            # print(distance.distance(meters=tags[0].pose_t[2][0]).destination((d_lat[frame_number],d_long[frame_number]),approx_drone_bearing).format_decimal())
+            bbox_center = int((result.boxes.xyxy[0][1]+result.boxes.xyxy[0][3])/2), int((result.boxes.xyxy[0][0]+result.boxes.xyxy[0][2])/2) # egentligen kan jag byta ordning på dessa så att det blir [y,x] men gör det i funktionen bbox_centerangle nu
+            bbox_cent_offset = bbox_centerangle(bbox_center, Camera_matrix)
+            b_dist = boat_distance([12,4], b_bearing_interpolated[frame_number], drone_bearing, Camera_matrix, result.boxes) 
 
-            # m = (1 / ((2 * math.pi / 360) * r_earth/1000)) / 1000
-            # newlatlong = distance.distance(meters=tags[0].pose_t[2][0]).destination((d_lat[frame_number],d_long[frame_number]),approx_drone_bearing)
-            # new_latitude, new_longitude = newlatlong.latitude, newlatlong.longitude
+            yolo_dist = distance.distance(meters=b_dist).destination((d_lat[frame_number],d_long[frame_number]),np.rad2deg(drone_bearing)+bbox_cent_offset)
+            yolo_lat, yolo_long = yolo_dist.latitude, yolo_dist.longitude
+            plt.scatter(yolo_long, yolo_lat ,color='purple')#, label='April tag + drone gps') # och denna 
 
+        # frame = im_array[int(result.boxes.xyxy[0][1]):int(result.boxes.xyxy[0][3]),int(result.boxes.xyxy[0][0]):int(result.boxes.xyxy[0][2])] # croppar framen utifrån object detection rutan TODO FIXA SÅ ATT DEN BARA CROPPAR RUNT BÅT detections
+        
+        
+        # cv2.SOLVEPNP_EPNP
+        if april_tags:
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            tags = at_detector.detect(frame, True, camera_params, 0.1735) #  130 mm är våran man mäter insidan och den anges i meter https://github.com/AprilRobotics/apriltag?tab=readme-ov-file#pose-estimation (blir 3 pixlar man mäter)
+            # print(tags) # https://github.com/duckietown/lib-dt-apriltags/tree/daffy
+                        # pose_t är på formen X,Y,Z och med högerhandkoordinatsystem blir det: [högerled_från kameran, höjdled, avstånd pekar ut ur kameran]
+            for tag in tags:
+                # print(tag.pose_t) # prints the pose_t probably on the form X,Y,Z which translates to [right, down, distance(depth)]
+                # print(tag)
+                dx = tag.pose_t[0] # X coordinate 
+                dy = tag.pose_t[2] # Z coordinate boats relative position to the camera (no altitude yet)
+                bca = boat_cam_angle(drone_bearing, tag, Camera_matrix)
+                approx_drone_bearing = np.rad2deg(drone_bearing) + bca#tag_center_angle(tags[0])
 
-            # print(new_latitude, new_longitude)
-            # new_latitude  = d_lat[frame_number]  + (dy / r_earth) * (180 / math.pi)
-            # new_longitude = d_long[frame_number] + (dx / r_earth) * (180 / math.pi) / math.cos(d_lat[frame_number] * math.pi/180) 
+                m = (1 / ((2 * math.pi / 360) * r_earth/1000)) / 1000
+                
+                newlatlong = distance.distance(meters=tag.pose_t[2][0]).destination((d_lat[frame_number],d_long[frame_number]),approx_drone_bearing)
+                new_latitude, new_longitude = newlatlong.latitude, newlatlong.longitude
+                plt.scatter(new_longitude,new_latitude,color='green')#, label='April tag + drone gps') # och denna 
 
+                for idx in range(len(tag.corners)):
+                    cv2.line(frame, tuple(tag.corners[idx-1, :].astype(int)), tuple(tag.corners[idx, :].astype(int)), (0, 255, 0))
 
+                cv2.putText(frame, str(tag.tag_id),
+                    org=(tag.corners[0, 0].astype(int)+10,tag.corners[0, 1].astype(int)+10),
+                    fontFace=cv2.FONT_HERSHEY_SIMPLEX,
+                    fontScale=0.8,
+                    color=(0, 0, 255))
 
         if visualization:
             cv2.imshow('Detected tags', frame)
             # k = cv2.waitKey(0)
             # if tags:
-            plt.scatter(d_long[frame_number],d_lat[frame_number],color='red')# , label='drone gps') # 
-            plt.scatter(b_interpolated_long[frame_number],b_interpolated_lat[frame_number],color='blue')#,label='boat gps') # boats coordinates
+            plt.scatter(d_long[frame_number],d_lat[frame_number],color='red' , label='drone gps') # 
+            plt.scatter(b_interpolated_long[frame_number],b_interpolated_lat[frame_number],color='blue',label='boat gps') # boats coordinates
             
-            if tags: 
-                plt.scatter(new_longitude,new_latitude,color='green')#, label='April tag + drone gps') # och denna 
+            # if tags: 
+                # plt.scatter(new_longitude,new_latitude,color='green')#, label='April tag + drone gps') # och denna 
 
             plt.legend(['drone gps', 'boat gps', 'April tags + drone gps'],loc='upper right')
             
